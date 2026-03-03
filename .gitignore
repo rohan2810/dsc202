@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Data — too large for git (download via pipeline/01_download_and_clean.py)
+data/raw/
+data/processed/
+
+# OS
+.DS_Store
