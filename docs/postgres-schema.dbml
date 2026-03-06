@@ -1,0 +1,28 @@
+// PostgreSQL schema (movies + movie_tags) for dbdiagram.io
+
+Table movies {
+  movie_id int [pk]
+  tmdb_id int
+  title text
+  year int
+  genres text
+  overview text
+  tagline text
+  director text
+  top_cast text
+  poster_path text
+  vote_average float
+  vote_count int
+  rating_mean float
+  rating_count int
+  bayesian_avg float
+}
+
+Table movie_tags {
+  movie_id int [ref: > movies.movie_id]
+  tag text
+  count int
+  Indexes {
+    movie_id [name: "idx_movie_tags_movie_id"]
+  }
+}
