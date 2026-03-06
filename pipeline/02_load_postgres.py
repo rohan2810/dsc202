@@ -24,10 +24,49 @@ cur = conn.cursor()
 print(f"Connected to Postgres: {DSN}")
 
 
+def load_streaming(cur, movies_df: pd.DataFrame) -> None:
+    """
+    Load streaming availability into Postgres from data/processed/streaming.csv.
+
+    This function:
+    - Reads the processed streaming CSV if it exists.
+    - Filters to movie IDs that are present in the movies DataFrame.
+    - Inserts rows into the movie_streaming table in bulk.
+    """
+    path = "data/processed/streaming.csv"
+    if not os.path.exists(path):
+        print("No streaming.csv found; skipping movie_streaming load.")
+        return
+
+    streaming = pd.read_csv(path)
+    if streaming.empty:
+        print("Streaming CSV is empty; skipping movie_streaming load.")
+        return
+
+    valid_ids = set(movies_df["movie_id"])
+    streaming = streaming[streaming["movie_id"].isin(valid_ids)]
+    if streaming.empty:
+        print("No streaming rows with valid movie_id; skipping movie_streaming load.")
+        return
+
+    rows = [
+        (int(r.movie_id), str(r.provider))
+        for r in streaming.itertuples(index=False)
+    ]
+    execute_values(
+        cur,
+        "INSERT INTO movie_streaming (movie_id, provider) VALUES %s",
+        rows,
+        page_size=1000,
+    )
+    print(f"Loaded {len(rows):,} streaming rows into Postgres.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Schema
 # ─────────────────────────────────────────────────────────────────────────────
 cur.execute("""
+    DROP TABLE IF EXISTS movie_streaming;
     DROP TABLE IF EXISTS movie_tags;
     DROP TABLE IF EXISTS movies;
 
@@ -55,6 +94,12 @@ cur.execute("""
         count     INTEGER
     );
     CREATE INDEX idx_movie_tags_movie_id ON movie_tags(movie_id);
+
+    CREATE TABLE movie_streaming (
+        movie_id  INTEGER REFERENCES movies(movie_id),
+        provider  TEXT
+    );
+    CREATE INDEX idx_movie_streaming_movie_id ON movie_streaming(movie_id);
 """)
 conn.commit()
 print("Schema created.")
@@ -110,6 +155,13 @@ execute_values(
 )
 conn.commit()
 print(f"Loaded {len(tag_rows):,} tags into Postgres.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Load streaming availability (optional)
+# ─────────────────────────────────────────────────────────────────────────────
+load_streaming(cur, movies)
+conn.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
