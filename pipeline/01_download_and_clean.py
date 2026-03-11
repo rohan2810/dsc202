@@ -215,15 +215,6 @@ if os.path.exists(streaming_raw_path):
             streaming_long["provider"].astype(str).str.strip().str.lower()
         )
 
-        # #region agent log
-        _key_counts = movies_join.groupby(["title_norm", "year"]).size()
-        _dupes = _key_counts[_key_counts > 1]
-        import json
-        _log = open("/Users/caleb/Desktop/Winter-26-Classes/202/dsc202/.cursor/debug-8ecafa.log", "a")
-        _log.write(json.dumps({"sessionId":"8ecafa","hypothesisId":"H1","location":"01_download_and_clean.py:streaming_merge","message":"movies_join merge key uniqueness","data":{"movies_join_rows":len(movies_join),"unique_title_year":_key_counts.shape[0],"duplicate_key_pairs":len(_dupes),"dupe_sample":list(_dupes.head(5).items()) if len(_dupes) else [],"streaming_long_rows":len(streaming_long)}})+"\n")
-        _log.close()
-        # #endregion
-
         # Join to canonical movies on normalized (title, year) to recover movie_id.
         # Allow many-to-many: same (title, year) can map to multiple movie_ids (remakes/dupes).
         streaming_joined = (

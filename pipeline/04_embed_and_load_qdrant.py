@@ -119,15 +119,6 @@ print(f"Collection info: {info.points_count:,} points, vector size={VECTOR_DIM}"
 
 print("\nTest search: 'mind-bending sci-fi time travel'")
 test_vec = model.encode("mind-bending sci-fi time travel", normalize_embeddings=True).tolist()
-# #region agent log
-try:
-    import json
-    _log = open("/Users/caleb/Desktop/Winter-26-Classes/202/dsc202/.cursor/debug-9bf33f.log", "a")
-    _log.write(json.dumps({"sessionId": "9bf33f", "hypothesisId": "H1-H4", "location": "04_embed_and_load_qdrant.py:test_search", "message": "Qdrant client API check", "data": {"has_query_points": hasattr(client, "query_points"), "has_search": hasattr(client, "search"), "client_type": type(client).__name__, "version": getattr(__import__("qdrant_client", fromlist=[""]), "__version__", "?")}, "timestamp": __import__("time").time() * 1000}) + "\n")
-    _log.close()
-except Exception:
-    pass
-# #endregion
 # Use search() (query_vector=) when query_points is missing (e.g. qdrant-client 1.9.x)
 if hasattr(client, "search"):
     results = client.search(collection_name=COLLECTION, query_vector=test_vec, limit=5)
