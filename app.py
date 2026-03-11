@@ -458,24 +458,27 @@ def graph_recommend(movie_id: int, limit: int = 20) -> list[dict]:
                 "explanation": f"⭐ {r['co_fans']} fans also loved this",
             }
 
-        # ── Signal 2: Shared tags ─────────────────────────────────────────
+        # ── Signal 2: Shared tags (weighted by tag frequency) ─────────────
+        # Use HAS_TAG.count to weight overlap: sum(min(seed_count, other_count)) across shared tags.
         tag_rows = s.run("""
-            MATCH (m:Movie {movie_id: $mid})-[:HAS_TAG]->(t:Tag)<-[:HAS_TAG]-(other:Movie)
+            MATCH (m:Movie {movie_id: $mid})-[r1:HAS_TAG]->(t:Tag)<-[r2:HAS_TAG]-(other:Movie)
             WHERE other.movie_id <> $mid AND other.bayesian_avg >= 3.0
-            WITH other, collect(t.name) AS shared_tags, count(DISTINCT t) AS tag_count
-            ORDER BY tag_count DESC LIMIT 80
+            WITH other,
+                 collect(t.name) AS shared_tags,
+                 sum(CASE WHEN r1.count < r2.count THEN r1.count ELSE r2.count END) AS weighted_overlap
+            ORDER BY weighted_overlap DESC LIMIT 80
             RETURN other.movie_id AS movie_id,
                    other.title AS title,
                    other.year AS year,
                    other.bayesian_avg AS bayesian_avg,
                    other.poster_path AS poster_path,
-                   shared_tags, tag_count
+                   shared_tags, weighted_overlap
         """, mid=movie_id).data()
 
-        max_tags = max((r["tag_count"] for r in tag_rows), default=1)
+        max_weighted = max((r["weighted_overlap"] for r in tag_rows), default=1)
         for r in tag_rows:
             mid   = r["movie_id"]
-            boost = (r["tag_count"] / max_tags) * 0.35
+            boost = (r["weighted_overlap"] / max_weighted) * 0.35
             tag_label = ", ".join(r["shared_tags"][:5])
             if mid not in scores:
                 scores[mid] = {**r, "composite": 0.0,
