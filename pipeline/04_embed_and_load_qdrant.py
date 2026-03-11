@@ -119,8 +119,14 @@ print(f"Collection info: {info.points_count:,} points, vector size={VECTOR_DIM}"
 
 print("\nTest search: 'mind-bending sci-fi time travel'")
 test_vec = model.encode("mind-bending sci-fi time travel", normalize_embeddings=True).tolist()
-results = client.query_points(COLLECTION, query=test_vec, limit=5)
-for h in results.points:
+# Use search() (query_vector=) when query_points is missing (e.g. qdrant-client 1.9.x)
+if hasattr(client, "search"):
+    results = client.search(collection_name=COLLECTION, query_vector=test_vec, limit=5)
+    points = results if isinstance(results, list) else getattr(results, "points", results)
+else:
+    results = client.query_points(COLLECTION, query=test_vec, limit=5)
+    points = results.points
+for h in points:
     print(f"  [{h.score:.3f}] {h.payload['title']} ({h.payload.get('year','')})")
 
 print("\nQdrant load complete.")

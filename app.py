@@ -14,6 +14,8 @@ from neo4j import GraphDatabase
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
+from typing import Optional
+from urllib.parse import quote
 
 load_dotenv()
 
@@ -151,6 +153,11 @@ html, body, [class*="css"] {
     font-weight: 500;
     margin: 1px 2px 1px 0;
 }
+.card-streaming {
+    font-size: 0.72rem;
+    color: #64748b;
+    margin-top: 4px;
+}
 .explain-badge {
     background: linear-gradient(135deg, #f0f0ff, #f8f5ff);
     border: 1px solid #ddd6fe;
@@ -234,6 +241,20 @@ section[data-testid="stSidebar"] hr {
     font-size: 0.72rem;
     margin: 2px 2px 2px 0;
 }
+.streaming-link, .streaming-pill {
+    color: #93c5fd !important;
+    text-decoration: none;
+    font-size: 0.85rem;
+}
+.streaming-link:hover {
+    text-decoration: underline;
+}
+.streaming-pill {
+    display: inline-block;
+    background: rgba(59,130,246,0.2);
+    border-radius: 4px;
+    padding: 2px 8px;
+}
 .sidebar-rating {
     background: rgba(245,158,11,0.15);
     border: 1px solid rgba(245,158,11,0.3);
@@ -315,15 +336,24 @@ pg     = get_pg()
 # ─────────────────────────────────────────────────────────────────────────────
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def _qdrant_vector_search(collection: str, query_vector: list, limit: int):
+    """Run vector search; supports both qdrant-client search() and query_points() APIs."""
+    if hasattr(qdrant, "search"):
+        results = qdrant.search(
+            collection_name=collection, query_vector=query_vector, limit=limit
+        )
+        return results if isinstance(results, list) else getattr(results, "points", results)
+    return qdrant.query_points(collection, query=query_vector, limit=limit).points
+
+
 def vector_search(query: str, limit: int = 20) -> list[dict]:
     """Search movies by natural language. Blends vector similarity with a
     quality signal so obscure low-rated films don't dominate results."""
-    vec     = model.encode(query, normalize_embeddings=True).tolist()
-    # Fetch extra candidates so quality re-ranking has room to work
-    results = qdrant.query_points("movies", query=vec, limit=limit * 5)
+    vec    = model.encode(query, normalize_embeddings=True).tolist()
+    points = _qdrant_vector_search("movies", vec, limit * 5)
 
     candidates = []
-    for h in results.points:
+    for h in points:
         avg = float(h.payload.get("bayesian_avg") or 0)
         # quality_boost: 0→0, 3.0→0.6, 3.5→0.7, 4.0→0.8, 5.0→1.0
         quality = min(avg / 5.0, 1.0) if avg > 0 else 0.0
@@ -344,6 +374,7 @@ def vector_search(query: str, limit: int = 20) -> list[dict]:
 
 
 def get_movie_detail(movie_id: int) -> dict:
+    """Fetch movie metadata, tags, and streaming providers from Postgres."""
     with pg.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM movies WHERE movie_id = %s", (movie_id,))
         row = cur.fetchone()
@@ -355,7 +386,34 @@ def get_movie_detail(movie_id: int) -> dict:
             (movie_id,),
         )
         movie["tags"] = [r["tag"] for r in cur.fetchall()]
+        # Streaming availability (from movie_streaming if table exists)
+        try:
+            cur.execute(
+                "SELECT provider FROM movie_streaming WHERE movie_id = %s ORDER BY provider",
+                (movie_id,),
+            )
+            movie["streaming"] = [r["provider"] for r in cur.fetchall()]
+        except psycopg2.ProgrammingError:
+            movie["streaming"] = []
     return movie
+
+
+def get_streaming_by_movie_ids(movie_ids: list[int]) -> dict[int, list[str]]:
+    """Batch-fetch streaming providers for many movies. Returns dict movie_id -> [provider, ...]."""
+    if not movie_ids:
+        return {}
+    out = {mid: [] for mid in movie_ids}
+    try:
+        with pg.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT movie_id, provider FROM movie_streaming WHERE movie_id = ANY(%s) ORDER BY movie_id, provider",
+                (movie_ids,),
+            )
+            for row in cur.fetchall():
+                out.setdefault(row["movie_id"], []).append(row["provider"])
+    except psycopg2.ProgrammingError:
+        pass
+    return out
 
 
 def graph_recommend(movie_id: int, limit: int = 20) -> list[dict]:
@@ -449,12 +507,12 @@ def graph_recommend(movie_id: int, limit: int = 20) -> list[dict]:
     try:
         seed_pts = qdrant.retrieve("movies", ids=[movie_id], with_vectors=True)
         if seed_pts and seed_pts[0].vector:
-            vec  = seed_pts[0].vector
-            hits = qdrant.query_points("movies", query=vec, limit=limit + 5)
+            vec   = seed_pts[0].vector
+            hits = _qdrant_vector_search("movies", vec, limit + 5)
             max_vscore = max(
-                (h.score for h in hits.points if h.id != movie_id), default=1.0
+                (h.score for h in hits if h.id != movie_id), default=1.0
             )
-            for h in hits.points:
+            for h in hits:
                 if h.id == movie_id:
                     continue
                 mid   = h.id
@@ -491,7 +549,8 @@ def graph_recommend(movie_id: int, limit: int = 20) -> list[dict]:
     return top
 
 
-def poster_url(path: str | None) -> str:
+def poster_url(path: Optional[str]) -> str:
+    """Return a full TMDB poster URL or a placeholder when no valid path is provided."""
     if path and str(path) not in ("nan", "None", ""):
         return TMDB_IMG_BASE + str(path)
     return PLACEHOLDER
@@ -513,6 +572,11 @@ def render_card(col, movie: dict, mode: str = "search"):
 
         genre_pills = "".join(f'<span class="genre-pill">{g}</span>' for g in genres)
         rating_html = f'<div class="movie-rating">★ {avg:.1f}</div>' if avg > 0 else ""
+        streaming = movie.get("streaming") or []
+        streaming_html = ""
+        if streaming:
+            labels = [p.replace("_", " ").title() for p in streaming]
+            streaming_html = f'<div class="card-streaming">Watch: {", ".join(labels)}</div>'
         if mode == "recommend" and explain:
             signals = explain.split(" · ")
             lines = "".join(f'<span class="signal">{s}</span>' for s in signals)
@@ -528,6 +592,7 @@ def render_card(col, movie: dict, mode: str = "search"):
             f'<div class="movie-year">{year}</div>'
             f'{rating_html}'
             f'<div>{genre_pills}</div>'
+            f'{streaming_html}'
             f'{explain_html}'
             f'</div></div>'
         )
@@ -541,6 +606,11 @@ def render_card(col, movie: dict, mode: str = "search"):
 
 
 def render_grid(movies: list[dict], mode: str = "search"):
+    """Render a grid of movie cards; enriches each movie with streaming providers when available."""
+    ids = [m["movie_id"] for m in movies]
+    streaming_map = get_streaming_by_movie_ids(ids)
+    for m in movies:
+        m["streaming"] = streaming_map.get(m["movie_id"], [])
     cols = st.columns(5, gap="medium")
     for i, movie in enumerate(movies):
         render_card(cols[i % 5], movie, mode=mode)
@@ -554,7 +624,7 @@ def render_detail_sidebar(movie_id: int):
         return
 
     with st.sidebar:
-        st.image(poster_url(detail.get("poster_path")), use_container_width=True)
+        st.image(poster_url(detail.get("poster_path")))
 
         st.markdown(
             f'<h3 style="margin-top:12px">{detail.get("title","")}'
@@ -596,6 +666,28 @@ def render_detail_sidebar(movie_id: int):
                 f'<span class="tag-chip">{t}</span>' for t in detail["tags"]
             )
             st.markdown(f"**Tags:** {chips}", unsafe_allow_html=True)
+
+        # Streaming: link to each provider's search when data is available
+        if detail.get("streaming"):
+            title_enc = quote(str(detail.get("title", "")))
+            # Map stored provider names to display labels and search URLs
+            provider_urls = {
+                "netflix": ("Netflix", "https://www.netflix.com/search?q="),
+                "hulu": ("Hulu", "https://www.hulu.com/search?q="),
+                "prime video": ("Prime Video", "https://www.primevideo.com/search/ref=atv_nb_sr?phrase="),
+                "disney+": ("Disney+", "https://www.disneyplus.com/search?q="),
+            }
+            links = []
+            for p in detail["streaming"]:
+                label, base = provider_urls.get(p.lower(), (p.replace("_", " ").title(), None))
+                if base:
+                    links.append(f'<a href="{base}{title_enc}" target="_blank" rel="noopener" class="streaming-link">{label}</a>')
+                else:
+                    links.append(f'<span class="streaming-pill">{label}</span>')
+            st.markdown(
+                "**Where to watch:** " + " · ".join(links),
+                unsafe_allow_html=True,
+            )
 
         if detail.get("overview"):
             st.markdown("---")

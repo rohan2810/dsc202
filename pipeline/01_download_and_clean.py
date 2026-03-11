@@ -11,6 +11,7 @@ Run: python pipeline/01_download_and_clean.py
 
 import os
 import io
+import time
 import zipfile
 import requests
 import pandas as pd
@@ -60,14 +61,28 @@ REMSKY_CACHE = f"{RAW}/remsky_movies.parquet"
 if not os.path.exists(REMSKY_CACHE):
     print("Loading Remsky movie metadata from HuggingFace (may take a few minutes)...")
     from datasets import load_dataset
-    remsky_ds = load_dataset(
-        "Remsky/Embeddings__Ultimate_1Million_Movies_Dataset",
-        split="train",
-        streaming=False,
-    )
-    remsky = remsky_ds.to_pandas()
-    remsky.to_parquet(REMSKY_CACHE, index=False)
-    print(f"Remsky: {len(remsky):,} movies cached to {REMSKY_CACHE}")
+    max_retries, backoff = 3, 10
+    for attempt in range(max_retries):
+        try:
+            remsky_ds = load_dataset(
+                "Remsky/Embeddings__Ultimate_1Million_Movies_Dataset",
+                split="train",
+                streaming=False,
+            )
+            remsky = remsky_ds.to_pandas()
+            remsky.to_parquet(REMSKY_CACHE, index=False)
+            print(f"Remsky: {len(remsky):,} movies cached to {REMSKY_CACHE}")
+            break
+        except (requests.exceptions.ConnectionError, OSError) as e:
+            if attempt < max_retries - 1:
+                print(f"HuggingFace connection failed (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2
+            else:
+                raise RuntimeError(
+                    "Could not load Remsky dataset from HuggingFace after retries. "
+                    "Check your network or try again later."
+                ) from e
 else:
     print("Loading Remsky from cache...")
     remsky = pd.read_parquet(REMSKY_CACHE)
@@ -141,9 +156,88 @@ movies = movies[[c for c in final_cols if c in movies.columns]].drop_duplicates(
 movies.to_csv(f"{PROC}/movies.csv", index=False)
 print(f"Saved {len(movies):,} movies → {PROC}/movies.csv")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Streaming availability (Kaggle MoviesOnStreamingPlatforms)
+# ─────────────────────────────────────────────────────────────────────────────
+# Build a clean streaming availability file by joining the Kaggle
+# MoviesOnStreamingPlatforms dataset to the canonical movies DataFrame.
+streaming_raw_path = f"{RAW}/MoviesOnStreamingPlatforms.csv"
+streaming_out_path = f"{PROC}/streaming.csv"
+
+if os.path.exists(streaming_raw_path):
+    print("Building streaming availability CSV from MoviesOnStreamingPlatforms.csv...")
+    streaming_raw = pd.read_csv(streaming_raw_path)
+
+    # Normalize title and year in the Kaggle dataset for a robust join.
+    streaming_raw["title_norm"] = (
+        streaming_raw["Title"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    streaming_raw["year"] = pd.to_numeric(
+        streaming_raw["Year"], errors="coerce"
+    ).astype("Int64")
+
+    # Build a slim join frame from canonical movies with the same normalized key.
+    # Strip trailing " (YYYY)" from MovieLens titles so they match Kaggle (Title + Year).
+    movies_join = movies[["movie_id", "title", "year"]].copy()
+    title_clean = (
+        movies_join["title"]
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\s*\(\d{4}\)\s*$", "", regex=True)
+        .str.strip()
+    )
+    movies_join["title_norm"] = title_clean.str.lower()
+
+    # Provider columns in the streaming dataset that indicate availability as 0/1.
+    provider_cols = ["Netflix", "Hulu", "Prime Video", "Disney+"]
+    for col in provider_cols:
+        if col not in streaming_raw.columns:
+            streaming_raw[col] = 0
+
+    # Reshape to long format so each row represents one (movie, provider) combination.
+    streaming_long = streaming_raw.melt(
+        id_vars=["title_norm", "year"],
+        value_vars=provider_cols,
+        var_name="provider",
+        value_name="available",
+    )
+
+    # Keep only rows where the movie is available on that provider.
+    streaming_long = streaming_long[streaming_long["available"] == 1].copy()
+    if streaming_long.empty:
+        print("No streaming availability rows after filtering; skipping streaming.csv.")
+    else:
+        # Normalize provider names (for example, "Prime Video" → "prime video").
+        streaming_long["provider"] = (
+            streaming_long["provider"].astype(str).str.strip().str.lower()
+        )
+
+        # Join to canonical movies on normalized (title, year) to recover movie_id.
+        # Allow many-to-many: same (title, year) can map to multiple movie_ids (remakes/dupes).
+        streaming_joined = (
+            streaming_long.merge(
+                movies_join,
+                on=["title_norm", "year"],
+                how="inner",
+            )
+            .loc[:, ["movie_id", "provider"]]
+            .drop_duplicates()
+        )
+
+        if streaming_joined.empty:
+            print("Streaming join produced zero rows; not writing streaming.csv.")
+        else:
+            streaming_joined.to_csv(streaming_out_path, index=False)
+            print(f"Saved {len(streaming_joined):,} streaming rows → {streaming_out_path}")
+else:
+    print(f"Streaming CSV not found at {streaming_raw_path}; skipping streaming.csv.")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Tags: top 20 per movie, min count 2
+# 5. Tags: top 20 per movie, min count 2
 # ─────────────────────────────────────────────────────────────────────────────
 valid_movie_ids = set(movies["movie_id"])
 
@@ -167,7 +261,7 @@ print(f"Saved {len(tags_agg):,} tag rows → {PROC}/tags.csv")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Ratings: all ratings for movies in our canonical set (no sampling)
+# 6. Ratings: all ratings for movies in our canonical set (no sampling)
 # Using all 25M makes collaborative filtering much more meaningful —
 # popular movies get high co-rated counts but Jaccard corrects for that.
 # ─────────────────────────────────────────────────────────────────────────────
