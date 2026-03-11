@@ -416,6 +416,10 @@ def get_streaming_by_movie_ids(movie_ids: list[int]) -> dict[int, list[str]]:
     return out
 
 
+def _norm_provider(p: str) -> str:
+    return str(p or "").strip().lower().replace("_", " ")
+
+
 def graph_recommend(movie_id: int, limit: int = 20) -> list[dict]:
     scores: dict[int, dict] = {}
 
@@ -549,6 +553,29 @@ def graph_recommend(movie_id: int, limit: int = 20) -> list[dict]:
     return top
 
 
+def recommend_streaming_filtered(movie_id: int, provider: str, limit: int = 20) -> list[dict]:
+    """
+    Run the normal recommendation engine, then filter results to movies that are
+    available on the given streaming provider (inclusive: may also be on others).
+    """
+    p_norm = _norm_provider(provider)
+    overfetch = max(limit * 5, 80)
+    candidates = graph_recommend(movie_id, limit=overfetch)
+    if not candidates:
+        return []
+
+    ids = [m["movie_id"] for m in candidates]
+    streaming_map = get_streaming_by_movie_ids(ids)
+
+    filtered = []
+    for m in candidates:
+        provs = [_norm_provider(x) for x in (streaming_map.get(m["movie_id"], []) or [])]
+        if p_norm in provs:
+            filtered.append(m)
+
+    return filtered[:limit]
+
+
 def poster_url(path: Optional[str]) -> str:
     """Return a full TMDB poster URL or a placeholder when no valid path is provided."""
     if path and str(path) not in ("nan", "None", ""):
@@ -679,7 +706,8 @@ def render_detail_sidebar(movie_id: int):
             }
             links = []
             for p in detail["streaming"]:
-                label, base = provider_urls.get(p.lower(), (p.replace("_", " ").title(), None))
+                p_norm = _norm_provider(p)
+                label, base = provider_urls.get(p_norm, (p.replace("_", " ").title(), None))
                 if base:
                     links.append(f'<a href="{base}{title_enc}" target="_blank" rel="noopener" class="streaming-link">{label}</a>')
                 else:
@@ -688,6 +716,21 @@ def render_detail_sidebar(movie_id: int):
                 "**Where to watch:** " + " · ".join(links),
                 unsafe_allow_html=True,
             )
+
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            for p in detail["streaming"]:
+                p_norm = _norm_provider(p)
+                label, _base = provider_urls.get(p_norm, (p.replace("_", " ").title(), None))
+                if st.button(
+                    f"See what else is streaming on {label}",
+                    key=f"stream_rec_{movie_id}_{p_norm}",
+                    use_container_width=True,
+                ):
+                    st.session_state["rec_id"] = movie_id
+                    st.session_state["rec_title"] = detail.get("title", "")
+                    st.session_state["rec_provider"] = p_norm
+                    st.session_state.pop("selected_id", None)
+                    st.rerun()
 
         if detail.get("overview"):
             st.markdown("---")
@@ -763,12 +806,18 @@ st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 if "rec_id" in st.session_state:
     rec_id    = st.session_state["rec_id"]
     rec_title = st.session_state["rec_title"]
+    rec_provider = st.session_state.get("rec_provider")
 
     col_a, col_b = st.columns([7, 1])
     with col_a:
+        if rec_provider:
+            provider_label = str(rec_provider).replace("_", " ").title()
+            header = f'Because you liked <em>{rec_title}</em> (and want <em>{provider_label}</em>)…'
+        else:
+            header = f'Because you liked <em>{rec_title}</em>…'
         st.markdown(
             f'<div class="section-header">'
-            f'<h2>Because you liked <em>{rec_title}</em>…</h2>'
+            f'<h2>{header}</h2>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -776,10 +825,14 @@ if "rec_id" in st.session_state:
         if st.button("← Back"):
             st.session_state.pop("rec_id", None)
             st.session_state.pop("rec_title", None)
+            st.session_state.pop("rec_provider", None)
             st.rerun()
 
     with st.spinner("Traversing graph..."):
-        recs = graph_recommend(rec_id)
+        if rec_provider:
+            recs = recommend_streaming_filtered(rec_id, str(rec_provider))
+        else:
+            recs = graph_recommend(rec_id)
 
     if recs:
         render_grid(recs, mode="recommend")
